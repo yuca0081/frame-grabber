@@ -11,7 +11,7 @@ python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-Dependencies are declared in `pyproject.toml` (pyside6 / mss / pillow). The `-e` flag is an editable install — source changes take effect immediately, no reinstall needed.
+Dependencies are declared in `pyproject.toml` (pyside6 / mss / pillow / imageio-ffmpeg). The `-e` flag is an editable install — source changes take effect immediately, no reinstall needed.
 
 ## Usage
 
@@ -40,7 +40,7 @@ Frames are saved to `~/Videos/FrameGrabber/session_date_time/` (changeable via "
 | O | Open session folder |
 
 **Onion skin**: overlays the previous frames (red) and next frames (blue) semi-transparently on the current frame, so motion displacement is visible at a glance — very handy for drawing continuous action.
-Zoom uses nearest-neighbor interpolation, so magnified frames stay sharp.
+Zoom uses nearest-neighbor interpolation, so magnified frames stay sharp. The **Export** button on the toolbar saves the session as a **ZIP archive / looping GIF / MP4 video**.
 
 ## Project Structure
 
@@ -53,6 +53,7 @@ frame-grabber/
 │   ├── recorder.py         # capture worker thread + floating control bar
 │   ├── viewer.py           # frame viewer (onion skin / variable speed / lossless zoom / LRU cache)
 │   ├── session.py          # session directory & metadata
+│   ├── icons.py            # embedded SVG icon rendering
 │   └── theme.py            # UI colors
 ├── tests/                  # smoke tests (offscreen, won't disturb your desktop)
 └── scripts/                # real-machine verification scripts (windows flash briefly)

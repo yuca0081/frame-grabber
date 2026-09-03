@@ -11,7 +11,7 @@ python -m venv .venv
 .venv\Scripts\pip install -e .
 ```
 
-依赖声明在 `pyproject.toml`（pyside6 / mss / pillow），`-e` 是可编辑安装——源码改动即时生效，无需重装。
+依赖声明在 `pyproject.toml`（pyside6 / mss / pillow / imageio-ffmpeg），`-e` 是可编辑安装——源码改动即时生效，无需重装。
 
 ## 使用
 
@@ -40,7 +40,7 @@ python -m venv .venv
 | O | 打开会话文件夹 |
 
 **洋葱皮**：把前几帧（红）和后几帧（蓝）半透明叠在当前帧上，一眼看出动作的位移幅度——画连续动作时非常好用。
-缩放是最近邻插值，放大边缘不糊。
+缩放是最近邻插值，放大边缘不糊。工具条「导出」按钮可导出 **ZIP 压缩包 / GIF 动图（循环播放）/ MP4 视频**。
 
 ## 项目结构
 
@@ -53,6 +53,7 @@ frame-grabber/
 │   ├── recorder.py         # 截屏工作线程 + 悬浮控制条
 │   ├── viewer.py           # 帧查看器（洋葱皮/变速/无损缩放/LRU 缓存）
 │   ├── session.py          # 会话目录与元数据
+│   ├── icons.py            # 内嵌 SVG 图标渲染
 │   └── theme.py            # 界面颜色
 ├── tests/                  # 冒烟测试（离屏跑，不打扰桌面）
 └── scripts/                # 真机验证脚本（会闪现窗口）
