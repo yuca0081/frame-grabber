@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "framegrabber"
+version = "1.0.0"
+description = "框选屏幕区域录制为帧序列，逐帧分析视频/动图动作"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "pyside6>=6.8",
+    "mss>=9.0",
+    "pillow>=10.0",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.gui-scripts]
+framegrabber = "framegrabber.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
