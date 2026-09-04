@@ -113,6 +113,7 @@ class LauncherWindow(QWidget):
         self._bar = FloatingBar(rect, storage_root=self._storage_root())
         self._bar.stopped.connect(self._on_stopped)
         self._bar.show()
+        self._bar.activateWindow()  # 拿到键盘焦点，ESC 立即可用
 
     def _on_stopped(self, session):
         self._bar = None

@@ -1,23 +1,30 @@
-"""帧查看器：逐帧步进、洋葱皮叠加、变速播放、无损缩放。
+"""帧查看器：逐帧步进、洋葱皮叠加、变速播放、无损缩放、胶片栏管理帧。
 
 内存策略：一次 60fps × 1 分钟的录制有 3600 张 PNG，全部解码约几个 GB，
 所以 FrameCache 惰性解码 + LRU 按字节上限淘汰，并在步进时预加载邻帧。
 """
 from __future__ import annotations
 
+import shutil
+import time
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap, QShortcut, QKeySequence
+from PySide6.QtCore import (
+    QEvent, QMutex, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer,
+    QWaitCondition, Signal,
+)
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, \
+    QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-    QMenu, QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSlider,
+    QVBoxLayout, QWidget,
 )
 
 from framegrabber.icons import icon
 from framegrabber.session import Session
-from framegrabber.theme import CANVAS_BG, MUTED, TEXT
+from framegrabber.theme import ACCENT, BG, CANVAS_BG, MUTED, PANEL_HI, TEXT
 
 
 class FrameCache:
@@ -68,6 +75,15 @@ class FrameCache:
             return None
         self._store(i, pm)
         return pm
+
+    def set_paths(self, paths: list[Path]):
+        """帧列表被编辑（删除/插入）后整体替换。
+
+        缓存按序号索引，增删后序号全部错位，只能整体作废重新惰性解码。
+        """
+        self._paths = list(paths)
+        self._cache.clear()
+        self._bytes = 0
 
     def tinted(self, i: int, kind: str) -> QPixmap | None:
         """染色帧（洋葱皮用）：白底染成主题色，像素内容相乘保留明暗。"""
@@ -231,6 +247,337 @@ class FrameCanvas(QWidget):
         self.setCursor(Qt.ArrowCursor)
 
 
+THUMB_H = 56      # 缩略图高度（逻辑像素）
+THUMB_PAD = 4     # 缩略图四周留白
+_MAX_THUMBS = 3000  # 缩略图缓存上限（约 60MB），超出整体清空重来
+
+
+def _retry_fs(op):
+    """执行文件操作，被占用时短暂重试。
+
+    Windows 上文件正被缩略图线程读取的瞬间，删除/改名会抛 PermissionError；
+    缩略图解码几十毫秒内结束，等一下再试几乎总能成功。
+    """
+    for _ in range(20):
+        try:
+            op()
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    op()  # 仍失败则抛出真实异常，交给调用方提示
+
+
+class _ThumbMaker(QThread):
+    """后台解码缩略图。QImage 可以在工作线程创建，QPixmap 必须在界面线程，
+    所以线程里只出 QImage，回到主线程再转 QPixmap。
+    代际号（gen）：帧列表被编辑后序号错位，旧请求的結果直接丢弃。"""
+
+    ready = Signal(int, int, QImage)  # 代际号, 帧序号, 缩略图
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._jobs: list[tuple[int, int, Path, float]] = []
+        self._pending: set[tuple[int, int]] = set()
+        self._mutex = QMutex()
+        self._cond = QWaitCondition()
+        self._stop = False
+
+    def request(self, gen: int, i: int, path: Path, dpr: float):
+        key = (gen, i)
+        self._mutex.lock()
+        if key not in self._pending:
+            self._pending.add(key)
+            self._jobs.append((gen, i, path, dpr))
+        self._mutex.unlock()
+        self._cond.wakeAll()
+
+    def shutdown(self):
+        self._mutex.lock()
+        self._stop = True
+        self._mutex.unlock()
+        self._cond.wakeAll()
+        self.wait(2000)
+
+    def run(self):
+        while True:
+            self._mutex.lock()
+            while not self._jobs and not self._stop:
+                self._cond.wait(self._mutex)
+            if self._stop:
+                self._mutex.unlock()
+                return
+            gen, i, path, dpr = self._jobs.pop(0)
+            self._pending.discard((gen, i))
+            self._mutex.unlock()
+            # 先把文件读进内存再解码：文件只在读取的几毫秒内被占用，
+            # 给主线程的删除/改名留出窗口
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue  # 刚被删掉的帧
+            img = QImage.fromData(data)
+            if not img.isNull():
+                img = img.scaledToHeight(
+                    max(1, round(THUMB_H * dpr)), Qt.SmoothTransformation)
+                self.ready.emit(gen, i, img)
+
+
+class FilmStrip(QWidget):
+    """胶片栏：一行缩略图展示所有帧。
+
+    交互：单击跳帧 · 按住拖动平移 · 滚轮横向滚动 · 右键删除/插入 ·
+    拖入图片文件插入到落点位置。当前帧青色高亮并自动保持在视野内。
+    """
+
+    indexSelected = Signal(int)      # 单击第 i 帧
+    deleteRequested = Signal(int)    # 删除第 i 帧
+    insertRequested = Signal(int)    # 在第 pos 帧之前插入（pos == 帧数 = 追加）
+    filesDropped = Signal(int, list)  # 在第 pos 帧之前插入这些图片文件
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._paths: list[Path] = []
+        self._gen = 0
+        self._thumbs: dict[int, QPixmap] = {}
+        self._widths: list[int] = []   # 每帧缩略图宽度（解码前按会话宽高比估）
+        self._current = -1
+        self._hover = -1
+        self._press_pos = None
+        self._press_idx = -1
+        self._dragging = False
+        self._user_scrolled = False  # 用户手动滚过：解码完成不拽回中心
+        self._maker = _ThumbMaker(self)
+        self._maker.ready.connect(self._on_thumb_ready)
+        self._maker.start()
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.setFixedHeight(THUMB_H + THUMB_PAD * 2)
+
+    def shutdown(self):
+        self._maker.shutdown()
+
+    # ---------- 数据 ----------
+
+    def set_paths(self, paths: list[Path], aspect: float = 4 / 3):
+        self._paths = list(paths)
+        self._gen += 1  # 作废在途的缩略图请求
+        self._thumbs.clear()
+        default_w = round(THUMB_H * max(0.1, aspect))
+        self._widths = [default_w] * len(self._paths)
+        self._hover = -1
+        self._user_scrolled = False
+        self._relayout()
+        self.update()
+
+    def _relayout(self):
+        if not self._widths:
+            self.setMinimumWidth(1)  # 空会话：无留白，不出滚动条
+            return
+        total = self._pad() * 2 + THUMB_PAD + sum(w + THUMB_PAD
+                                                  for w in self._widths)
+        self.setMinimumWidth(max(total, 1))
+
+    def _xs(self) -> list[int]:
+        """每帧缩略图左边缘 x（首尾各有半视口留白，帧间以 PAD 分隔）。"""
+        xs, x = [], self._pad() + THUMB_PAD
+        for w in self._widths:
+            xs.append(x)
+            x += w + THUMB_PAD
+        return xs
+
+    # 视口尺寸变化（窗口缩放）→ 留白和居中位置都要跟着变
+    def event(self, e):
+        if e.type() == QEvent.ParentChange and self.parentWidget() is not None:
+            self.parentWidget().installEventFilter(self)
+            self._relayout()
+        return super().event(e)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Resize:
+            self._relayout()
+            if not self._user_scrolled:
+                self._center_on(self._current)
+        return super().eventFilter(obj, ev)
+
+    def set_current(self, i: int):
+        self._current = i
+        self._user_scrolled = False
+        self._center_on(i)
+        self.update()
+
+    def _center_on(self, i: int):
+        """把第 i 帧滚到视口正中（播放头固定居中的时间轴行为）。"""
+        sb = self._hbar()
+        if sb is None or not 0 <= i < len(self._widths):
+            return
+        x, w = self._xs()[i], self._widths[i]
+        sb.setValue(round(x + w / 2 - self._view_w() / 2))
+
+    def _scroll_area(self) -> QScrollArea | None:
+        p = self.parentWidget()
+        while p is not None and not isinstance(p, QScrollArea):
+            p = p.parentWidget()
+        return p
+
+    def _hbar(self):
+        sa = self._scroll_area()
+        return sa.horizontalScrollBar() if sa is not None else None
+
+    def _view_w(self) -> int:
+        sa = self._scroll_area()
+        return sa.viewport().width() if sa is not None else 0
+
+    def _pad(self) -> int:
+        """内容首尾各留半个视口宽，让第 0 帧和末帧也能居中。"""
+        return self._view_w() // 2
+
+    def _index_at(self, x: int) -> int:
+        for i, x0 in enumerate(self._xs()):
+            if x0 <= x < x0 + self._widths[i] + THUMB_PAD:
+                return i
+        return -1
+
+    # ---------- 缩略图 ----------
+
+    def _request_thumb(self, i: int):
+        self._maker.request(self._gen, i, self._paths[i], self.devicePixelRatio())
+
+    def _on_thumb_ready(self, gen: int, i: int, img: QImage):
+        if gen != self._gen or not 0 <= i < len(self._paths):
+            return
+        if len(self._thumbs) >= _MAX_THUMBS:  # 超预算整体清空，可见的马上会重新请求
+            self._thumbs.clear()
+        dpr = self.devicePixelRatio()
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(dpr)
+        self._thumbs[i] = pm
+        w = round(pm.width() / dpr)
+        if w != self._widths[i]:
+            self._widths[i] = w
+            self._relayout()
+            if not self._user_scrolled:
+                self._center_on(self._current)
+
+    # ---------- 绘制 ----------
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(BG))
+        n = len(self._paths)
+        if n == 0:
+            p.setPen(QColor(MUTED))
+            p.drawText(self.rect(), Qt.AlignCenter, "无帧 · 右键或拖入图片可插入")
+            return
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        vis = self.visibleRegion().boundingRect()
+        xs = self._xs()
+        for i in range(n):
+            x, w = xs[i], self._widths[i]
+            if x > vis.right() or x + w < vis.left():
+                continue
+            rect = QRect(x, THUMB_PAD, w, THUMB_H)
+            pm = self._thumbs.get(i)
+            if pm is None:
+                p.fillRect(rect, QColor(PANEL_HI))
+                p.setPen(QColor(MUTED))
+                p.drawText(rect, Qt.AlignCenter, str(i + 1))
+                self._request_thumb(i)
+            else:
+                p.drawPixmap(x, THUMB_PAD, pm)
+            # 当前帧青色描边（选区语义色），悬停弱描边
+            edge = ACCENT if i == self._current else (
+                "#64748B" if i == self._hover else None)
+            if edge:
+                p.setPen(QPen(QColor(edge), 2))
+                p.drawRect(rect.adjusted(1, 1, -1, -1))
+
+    # ---------- 鼠标 ----------
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._press_pos = e.position().toPoint()
+            self._press_idx = self._index_at(self._press_pos.x())
+            self._dragging = False
+
+    def mouseMoveEvent(self, e):
+        pos = e.position().toPoint()
+        if self._press_pos is not None and not self._dragging:
+            if (pos - self._press_pos).manhattanLength() > 5:
+                self._dragging = True
+                self.setCursor(Qt.ClosedHandCursor)
+        if self._dragging:
+            sb = self._hbar()
+            if sb is not None:
+                self._user_scrolled = True
+                sb.setValue(sb.value() + self._press_pos.x() - pos.x())
+            self._press_pos = pos
+        elif self._press_pos is None:
+            i = self._index_at(pos.x())
+            if i != self._hover:
+                self._hover = i
+                self.setCursor(Qt.PointingHandCursor if i >= 0
+                               else Qt.ArrowCursor)
+                self.update()
+
+    def mouseReleaseEvent(self, e):
+        if (e.button() == Qt.LeftButton and self._press_pos is not None
+                and not self._dragging and self._press_idx >= 0):
+            self.indexSelected.emit(self._press_idx)
+        self._press_pos = None
+        self._press_idx = -1
+        self._dragging = False
+        self.setCursor(Qt.ArrowCursor)
+
+    def leaveEvent(self, _):
+        self._hover = -1
+        self.update()
+
+    def wheelEvent(self, e):
+        sb = self._hbar()
+        if sb is not None:
+            self._user_scrolled = True
+            d = e.angleDelta().x() or e.angleDelta().y()
+            sb.setValue(sb.value() - d)
+            e.accept()
+
+    def contextMenuEvent(self, e):
+        m = QMenu(self)
+        i = self._index_at(e.pos().x())
+        if i >= 0:
+            m.addAction(f"删除第 {i + 1} 帧\tDel",
+                       lambda: self.deleteRequested.emit(i))
+            m.addAction(f"在第 {i + 1} 帧后插入图片…",
+                       lambda: self.insertRequested.emit(i + 1))
+        else:
+            m.addAction("追加图片到末尾…",
+                       lambda: self.insertRequested.emit(len(self._paths)))
+        m.exec(e.globalPos())
+
+    # ---------- 拖放插入 ----------
+
+    _IMG_EXTS = {".png", ".jpg", ".jpeg"}
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and self._droppable(e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        files = [u.toLocalFile() for u in e.mimeData().urls()
+                 if Path(u.toLocalFile()).suffix.lower() in self._IMG_EXTS]
+        if not files:
+            return
+        i = self._index_at(e.position().x())
+        pos = i + 1 if i >= 0 else len(self._paths)  # 空白处 = 追加
+        self.filesDropped.emit(pos, files)
+
+    def _droppable(self, urls) -> bool:
+        return any(Path(u.toLocalFile()).suffix.lower() in self._IMG_EXTS
+                   for u in urls)
+
+
 class ViewerWindow(QMainWindow):
     SPEEDS = [0.1, 0.25, 0.5, 1.0, 2.0]
     DEFAULT_SPEED = 1.0
@@ -255,13 +602,13 @@ class ViewerWindow(QMainWindow):
         self._build_ui()
         self._bind_keys()
 
-        n = len(self._cache)
-        self.statusBar().showMessage(
-            f"{n} 帧 · {session.fps} fps · {session.dir}    "
-            f"←/→ 逐帧 · 空格 播放 · ↑/↓ 变速 · Ctrl+滚轮 缩放 · +/- 洋葱皮"
-        )
+        self._update_status()
         self._set_index(0, pause=False)
         self.canvas.fit()
+        # 应用退出时窗口可能不经 closeEvent 直接销毁，确保缩略图线程先停下
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.strip.shutdown)
 
     # ---------- 界面 ----------
 
@@ -378,6 +725,21 @@ class ViewerWindow(QMainWindow):
         h2.addWidget(self.btn_folder)
         h2.addWidget(self.btn_export)
 
+        # 第三行：胶片栏（全部帧的缩略图；单击跳帧、右键删除/插入、拖入图片插入）
+        self.strip = FilmStrip()
+        self.strip.indexSelected.connect(self._set_index)
+        self.strip.deleteRequested.connect(self._delete_frame)
+        self.strip.insertRequested.connect(self._insert_images_at)
+        self.strip.filesDropped.connect(self._insert_images_at)
+        self.strip.set_paths(self._session.frame_paths, self._strip_aspect())
+        self.strip_area = QScrollArea()
+        self.strip_area.setObjectName("filmstripArea")
+        self.strip_area.setWidget(self.strip)
+        self.strip_area.setWidgetResizable(True)
+        self.strip_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.strip_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.strip_area.setFixedHeight(THUMB_H + THUMB_PAD * 2 + 12)
+
         central = QWidget()
         v = QVBoxLayout(central)
         v.setContentsMargins(0, 0, 0, 0)
@@ -385,6 +747,7 @@ class ViewerWindow(QMainWindow):
         v.addWidget(row1)
         v.addWidget(row2)
         v.addWidget(self.canvas, 1)
+        v.addWidget(self.strip_area)
         self.setCentralWidget(central)
 
     def _bind_keys(self):
@@ -403,6 +766,8 @@ class ViewerWindow(QMainWindow):
             (QKeySequence(Qt.Key_Minus), lambda: self._set_onion(self.onion - 1)),
             (QKeySequence(Qt.Key_Home), lambda: self._step_to(0)),
             (QKeySequence(Qt.Key_End), lambda: self._step_to(len(self._cache) - 1)),
+            (QKeySequence(Qt.Key_Delete),
+             lambda: self._delete_frame(self.canvas.index)),
             (QKeySequence(Qt.Key_O), self._session.open_in_explorer),
         ]
         for seq, slot in pairs:
@@ -453,6 +818,7 @@ class ViewerWindow(QMainWindow):
         if pause and self._playing:
             self._toggle_play()
         self.canvas.set_index(i)
+        self.strip.set_current(i)
         if not from_slider:
             self.slider.blockSignals(True)
             self.slider.setValue(i)
@@ -464,6 +830,96 @@ class ViewerWindow(QMainWindow):
 
     def _step_to(self, i: int):
         self._set_index(i)
+
+    # ---------- 帧编辑（胶片栏：删除 / 插入） ----------
+
+    def _strip_aspect(self) -> float:
+        r = self._session.region or {}
+        if r.get("width") and r.get("height"):
+            return r["width"] / r["height"]
+        return 4 / 3
+
+    def _delete_frame(self, i: int):
+        paths = self._session.frame_paths
+        if not 0 <= i < len(paths):
+            return
+        try:
+            _retry_fs(paths[i].unlink)  # 直接删磁盘文件，无撤销——按 Del 前看清楚
+        except OSError as exc:
+            QMessageBox.warning(self, "删除失败", f"无法删除文件：\n{exc}")
+            return
+        del paths[i]
+        self._paths_changed(prefer=i)  # 跳到被删帧的后一帧
+
+    def _insert_images_at(self, pos: int, files: list | None = None):
+        """把外部图片插入序列。pos = 插入位置（插到第 pos 帧之前）。"""
+        if files is None:  # 来自右键菜单：弹文件选择框
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "选择要插入的图片", str(self._session.dir),
+                "图片 (*.png *.jpg *.jpeg);;所有文件 (*)")
+        files = [f for f in files
+                 if Path(f).suffix.lower() in FilmStrip._IMG_EXTS]
+        if not files:
+            return
+        paths = self._session.frame_paths
+        pos = max(0, min(pos, len(paths)))
+        # 先复制成 .insert_ 前缀（rescan 的 frame_* 匹配不到，中途失败不留半成品）
+        staged: list[Path] = []
+        try:
+            for k, f in enumerate(files):
+                src = Path(f)
+                ext = (".jpg" if src.suffix.lower() in (".jpg", ".jpeg")
+                       else ".png")
+                dst = self._session.dir / f".insert_{pos + k:06d}{ext}"
+                shutil.copy2(src, dst)
+                staged.append(dst)
+        except OSError as exc:
+            for p in staged:
+                p.unlink(missing_ok=True)
+            QMessageBox.warning(self, "插入失败", f"无法复制图片：\n{exc}")
+            return
+        new_paths = list(paths)
+        new_paths[pos:pos] = staged
+        try:
+            self._session.frame_paths = self._renumber(new_paths)
+        except OSError as exc:
+            QMessageBox.warning(self, "插入失败", f"无法重排帧文件：\n{exc}")
+            return
+        self._paths_changed(prefer=pos, pause=False)  # 跳到第一张插入的图
+
+    def _renumber(self, paths: list[Path]) -> list[Path]:
+        """两阶段重命名：先全部改成 .tmp_ 前缀（此时目标名可能仍被占用），
+        再按给定顺序改回 frame_%06d 连续编号。"""
+        tmps = []
+        for i, p in enumerate(paths):
+            t = p.with_name(f".tmp_{i:06d}{p.suffix}")
+            _retry_fs(lambda p=p, t=t: p.rename(t))
+            tmps.append(t)
+        final = []
+        for i, t in enumerate(tmps):
+            f = self._session.dir / f"frame_{i:06d}{t.suffix}"
+            _retry_fs(lambda t=t, f=f: t.rename(f))
+            final.append(f)
+        return final
+
+    def _paths_changed(self, prefer: int, pause: bool = True):
+        """删除/插入后统一收口：元数据、缓存、滑块、胶片栏、状态栏同步。"""
+        paths = self._session.frame_paths
+        n = len(paths)
+        self._session.write_metadata()
+        self._cache.set_paths(paths)
+        self.strip.set_paths(paths, self._strip_aspect())
+        self.slider.setMaximum(max(0, n - 1))
+        self._update_status()
+        self._set_index(min(prefer, n - 1) if n else 0, pause=pause)
+
+    def _update_status(self):
+        n = len(self._cache)
+        self.statusBar().showMessage(
+            f"{n} 帧 · {self._session.fps} fps · {self._session.dir}    "
+            f"←/→ 逐帧 · 空格 播放 · ↑/↓ 变速 · Ctrl+滚轮 缩放 · "
+            f"+/- 洋葱皮 · Del 删除帧"
+        )
 
     # ---------- 参数 ----------
 
@@ -529,5 +985,6 @@ class ViewerWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._timer.stop()
+        self.strip.shutdown()  # 停缩略图线程，避免窗口销毁时线程仍在跑
         self.closed.emit()
         super().closeEvent(e)

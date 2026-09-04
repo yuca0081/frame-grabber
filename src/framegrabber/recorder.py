@@ -14,7 +14,8 @@ from pathlib import Path
 import mss
 from PIL import Image
 from PySide6.QtCore import QObject, QPoint, QSize, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPen, \
+    QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget,
 )
@@ -233,9 +234,9 @@ class FloatingBar(QWidget):
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_stop.clicked.connect(self._request_finish)
         self.btn_close.clicked.connect(self._cancel)
-        self._set_info(
-            f"区域 {region['width']}×{region['height']} · 选好帧率点录制", INFO_SKY
-        )
+        # 框选完成后按 ESC 取消（未录制=丢弃，已录制=停止并保存，同关闭按钮）
+        QShortcut(QKeySequence(Qt.Key_Escape), self, self._cancel)
+        self._set_info(f"区域 {region['width']}×{region['height']}", INFO_SKY)
 
         self.adjustSize()
         self._position()

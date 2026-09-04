@@ -156,6 +156,66 @@ def test_viewer(tmp: Path, app):
     v.close()
 
 
+def test_filmstrip(tmp: Path, app):
+    """胶片栏编辑：删除帧 / 插入外部图片 / 重编号 / 删空。"""
+    print("\n== FilmStrip 帧编辑 ==")
+    from PIL import Image as PILImage
+
+    s = Session.open(make_fake_session(tmp))
+    v = ViewerWindow(s)
+    v.show()
+    app.processEvents()
+
+    # 播放头固定居中：当前帧滚到视口正中（首尾留白使边缘帧也能居中）
+    v._set_index(10)
+    sb, vw = v.strip._hbar(), v.strip._view_w()
+    x, w = v.strip._xs()[10], v.strip._widths[10]
+    check("胶片栏当前帧居中", abs(sb.value() - (x + w / 2 - vw / 2)) <= 1,
+          f"scroll={sb.value()}")
+
+    v._delete_frame(1)
+    app.processEvents()
+    check("删除后帧数 19", len(v._session.frame_paths) == 19)
+    check("删除后跳到原第 2 帧位置", v.frame_label.text() == "2 / 19",
+          v.frame_label.text())
+    check("被删文件从磁盘消失", not (s.dir / "frame_000001.png").exists())
+
+    ext_png = tmp / "ext_a.png"
+    ext_jpg = tmp / "ext_b.jpg"
+    PILImage.new("RGB", (100, 50), (200, 30, 30)).save(ext_png)
+    PILImage.new("RGB", (60, 90), (30, 30, 200)).save(ext_jpg)
+    v._insert_images_at(4, [str(ext_png), str(ext_jpg)])
+    app.processEvents()
+    check("插入后帧数 21", len(v._session.frame_paths) == 21)
+    check("跳到第一张插入图", v.frame_label.text() == "5 / 21",
+          v.frame_label.text())
+    names = [p.name for p in s.frame_paths]
+    check("重编号连续且无临时文件残留",
+          len(names) == 21 and all(n.startswith("frame_") for n in names)
+          and not [p for p in s.dir.iterdir()
+                   if p.name.startswith((".tmp_", ".insert_"))],
+          " ".join(names[:7]))
+    check("插入图内容在位（jpg 保留原格式）",
+          PILImage.open(s.dir / "frame_000004.png").size == (100, 50)
+          and PILImage.open(s.dir / "frame_000005.jpg").size == (60, 90))
+    s2 = Session.open(s.dir)
+    check("重开会话顺序一致",
+          [p.name for p in s2.frame_paths] == names)
+
+    for _ in range(len(v._session.frame_paths)):
+        v._delete_frame(0)  # 与缩略图线程抢文件也不应失败（重试机制）
+    app.processEvents()
+    check("删空后标签", v.frame_label.text() == "无帧", v.frame_label.text())
+    shot = v.grab()  # 空会话渲染不应崩溃
+    check("删空后渲染不崩", not shot.isNull())
+
+    v._insert_images_at(0, [str(ext_png)])
+    app.processEvents()
+    check("空会话插入 1 帧", v.frame_label.text() == "1 / 1",
+          v.frame_label.text())
+    v.close()
+
+
 def test_palette_lossless():
     """≤256 色内容自动存索引 PNG——必须严格无损。"""
     print("\n== 索引色 PNG 无损性 ==")
@@ -197,6 +257,7 @@ def main():
 
     test_session(tmp)
     test_viewer(tmp, app)
+    test_filmstrip(tmp, app)
     test_palette_lossless()
     test_capture_worker(tmp)
 

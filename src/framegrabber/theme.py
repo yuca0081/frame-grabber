@@ -121,6 +121,11 @@ QScrollBar::handle:vertical {{
     background: {PANEL_HI}; border-radius: 5px; min-height: 30px;
 }}
 QScrollBar::handle:vertical:hover {{ background: #475569; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; }}
+QScrollBar::handle:horizontal {{
+    background: {PANEL_HI}; border-radius: 5px; min-width: 30px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: #475569; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
@@ -132,6 +137,13 @@ QLabel#frameCounter {{
     color: {TEXT};
 }}
 QStatusBar {{ color: {MUTED}; background: transparent; }}
+
+/* ---- 查看器胶片栏 ---- */
+QScrollArea#filmstripArea {{
+    background: {BG};
+    border: none;
+    border-top: 1px solid {BORDER};
+}}
 
 /* ---- 悬浮控制条 ---- */
 FloatingBar {{
